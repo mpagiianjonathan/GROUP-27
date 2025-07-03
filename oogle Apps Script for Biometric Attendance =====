@@ -1,0 +1,288 @@
+// ===== Google Apps Script for Biometric Attendance =====
+function doGet(e) {
+  const response = main(e);
+  return ContentService.createTextOutput(JSON.stringify(response))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function main(e) {
+  try {
+    const CONFIG = {
+      SPREADSHEET_ID: "1ZBEF2GcnSqfSGURIujZxAt73qsuLCd3VyRMcBIx-K10",
+      TIMEZONE: "Africa/Kampala",
+      STATUS_TYPES: {
+        ATTENDED: "ATTENDED",
+        ABSENT: "ABSENT"
+      },
+      ALLOW_HASH_PREFIX: true,
+      MAX_SHEET_ROWS: 10000,
+      ARCHIVE_THRESHOLD: 1000 // Number of rows to keep before archiving
+    };
+
+    // Enhanced student database with registration numbers and updated contacts
+    const STUDENT_DATABASE = {
+      1: { 
+        name: "MASABA JONATHAN", 
+        class: "ELECTRONICS", 
+        department: "COMPUTER", 
+        registration: "2023/DEE/DAY/1368",
+        contact: "+256705155891", 
+        secondaryContact: "+256701306866" 
+      },
+      2: { 
+        name: "MPAGI IAN JONATHAN", 
+        class: "ELECTRICAL", 
+        department: "SCIENCES", 
+        registration: "2023/DEE/DAY/1059",
+        contact: "+256701306866", 
+        secondaryContact: "+256743392499" 
+      },
+      3: { 
+        name: "NAKIIRYA SARAH", 
+        class: "MECHANICAL", 
+        department: "ENGINEERING", 
+        registration: "2023/DEE/DAY/0391",
+        contact: "+256750078203", 
+        secondaryContact: "+256781301702" 
+      },
+      4: { 
+        name: "NALWADDA AISHA", 
+        class: "BUILDING", 
+        department: "CIVIL", 
+        registration: "2023/DEE/DAY/1218/G",
+        contact: "+256781301702", 
+        secondaryContact: "+256750078203" 
+      },
+      5: { 
+        name: "KAWEESA MEDAAD", 
+        class: "WELDING", 
+        department: "MECHANICAL", 
+        registration: "2023/DEE/DAY/1363",
+        contact: "+256703559029", 
+        secondaryContact: "+256758245455" 
+      },
+      6: { 
+        name: "NANSAMBA GLORIA", 
+        class: "HAIRDRESSING", 
+        department: "BEAUTY", 
+        registration: "2023/DEE/DAY/1437/G",
+        contact: "+256759314436", 
+        secondaryContact: "+256703559029" 
+      },
+      10: { 
+        name: "DERRICK", 
+        class: "ELECTRONICS", 
+        department: "ENGINEERING", 
+        registration: "N/A",
+        contact: "+256758245455", 
+        secondaryContact: "+256764609750" 
+      },
+      11: { 
+        name: "ME", 
+        class: "ELECTRONICS", 
+        department: "ENGINEERING", 
+        registration: "2023/DEE/DAY/1363",
+        contact: "+256764609750", 
+        secondaryContact: "+256764609750" 
+      },
+      12: { 
+        name: "TEST", 
+        class: "ELECTRONICS", 
+        department: "ENGINEERING", 
+        registration: "1234577",
+        contact: "+256709061212", 
+        secondaryContact: "+256764609750" 
+      }
+    };
+
+    // Validate request
+    if (!e || !e.parameter || !e.parameter.id) {
+      throw new Error("No ID provided in request");
+    }
+
+    // Process ID
+    let rawId = e.parameter.id.toString().trim();
+    let idStr = CONFIG.ALLOW_HASH_PREFIX ? rawId.replace(/^#/, '') : rawId;
+    if (!/^\d+$/.test(idStr)) {
+      throw new Error(`Invalid ID format - must be a number (received: ${rawId})`);
+    }
+    
+    const id = parseInt(idStr);
+    if (id <= 0) {
+      throw new Error("ID must be a positive number");
+    }
+
+    // Get student record
+    const student = STUDENT_DATABASE[id];
+    if (!student) {
+      throw new Error(`Student ID ${id} not found in database`);
+    }
+
+    // Get or create attendance sheet with proper setup
+    const spreadsheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    let sheet = spreadsheet.getSheetByName("Attendance") || createAttendanceSheet(spreadsheet);
+
+    // Check if sheet is getting too large
+    if (sheet.getMaxRows() > CONFIG.MAX_SHEET_ROWS) {
+      archiveOldRecords(sheet, CONFIG.ARCHIVE_THRESHOLD);
+    }
+
+    // Process attendance record
+    const today = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "dd/MM/yyyy");
+    const lastEntry = findLastEntry(sheet, id, today);
+    
+    let action, duration = "";
+    const now = new Date();
+    const time = Utilities.formatDate(now, CONFIG.TIMEZONE, "HH:mm:ss");
+
+    if (lastEntry && !lastEntry.timeOut) {
+      // Student is checking out
+      action = "CHECK_OUT";
+      const timeIn = new Date(`${lastEntry.date} ${lastEntry.timeIn}`);
+      duration = Math.round((now - timeIn) / (1000 * 60)); // minutes
+      
+      // Update the existing row with checkout time and duration
+      sheet.getRange(lastEntry.row, 10).setValue(time); // Time Out (column J)
+      sheet.getRange(lastEntry.row, 12).setValue(duration); // Duration (column L)
+    } else {
+      // Student is checking in
+      action = "CHECK_IN";
+      const newRow = [
+        id, 
+        student.name, 
+        student.class, 
+        student.department,
+        student.registration,
+        student.contact, 
+        student.secondaryContact,
+        today, 
+        time, 
+        "", // Time Out (empty)
+        CONFIG.STATUS_TYPES.ATTENDED, 
+        "", // Duration (empty)
+        ""  // Notes (empty)
+      ];
+      sheet.appendRow(newRow);
+      formatNewRow(sheet, sheet.getLastRow());
+    }
+
+    return {
+      status: "success",
+      action: action,
+      student: {
+        id: id,
+        name: student.name,
+        class: student.class,
+        department: student.department,
+        registration: student.registration
+      },
+      contact: {
+        primary: student.contact,
+        secondary: student.secondaryContact
+      },
+      duration: duration,
+      timestamp: { 
+        date: today, 
+        time: time,
+        timezone: CONFIG.TIMEZONE
+      }
+    };
+
+  } catch (error) {
+    console.error(`Error processing request: ${error.message}`);
+    return {
+      status: "error",
+      message: error.message,
+      timestamp: new Date().toISOString(),
+      request: e ? e.parameter : null
+    };
+  }
+}
+
+// Helper function to create a properly formatted attendance sheet
+function createAttendanceSheet(spreadsheet) {
+  const sheet = spreadsheet.insertSheet("Attendance");
+  const headers = [
+    "ID", "Name", "Class", "Department", "Registration No.",
+    "Primary Contact", "Secondary Contact", 
+    "Date", "Time In", "Time Out", 
+    "Status", "Duration (mins)", "Notes"
+  ];
+  
+  sheet.appendRow(headers);
+  
+  // Format header row
+  const headerRange = sheet.getRange(1, 1, 1, headers.length);
+  headerRange
+    .setBackground("#4a86e8")
+    .setFontColor("white")
+    .setFontWeight("bold")
+    .setHorizontalAlignment("center");
+  
+  // Set column widths
+  const widths = [60, 180, 100, 120, 150, 130, 130, 100, 100, 100, 100, 100, 200];
+  widths.forEach((width, index) => {
+    sheet.setColumnWidth(index + 1, width);
+  });
+  
+  // Set data validation for status column
+  const statusValidation = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["ATTENDED", "ABSENT", "LATE", "EXCUSED"])
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(2, 11, sheet.getMaxRows() - 1, 1).setDataValidation(statusValidation);
+  
+  sheet.setFrozenRows(1);
+  return sheet;
+}
+
+// Finds the last entry for a student on a specific date
+function findLastEntry(sheet, id, date) {
+  const data = sheet.getDataRange().getValues();
+  
+  // Start from the last row and go upwards
+  for (let i = data.length - 1; i > 0; i--) {
+    if (data[i][0] == id && data[i][7] == date) {
+      return {
+        row: i + 1,
+        date: data[i][7],
+        timeIn: data[i][8],
+        timeOut: data[i][9]
+      };
+    }
+  }
+  return null;
+}
+
+// Formats a new row with alternating colors and proper number formats
+function formatNewRow(sheet, row) {
+  const rowRange = sheet.getRange(row, 1, 1, 13);
+  
+  // Alternate row colors
+  rowRange.setBackground(row % 2 === 0 ? "#f3f3f3" : "#ffffff");
+  
+  // Set number formats
+  sheet.getRange(row, 8).setNumberFormat("dd/MM/yyyy"); // Date column
+  sheet.getRange(row, 9, 1, 2).setNumberFormat("HH:mm:ss"); // Time columns
+  sheet.getRange(row, 12).setNumberFormat("0"); // Duration as whole number
+}
+
+// Archives old records to prevent sheet from getting too large
+function archiveOldRecords(sheet, keepRows = 1000) {
+  const archiveSheetName = "Archive_" + Utilities.formatDate(new Date(), "GMT", "yyyyMMdd");
+  let archiveSheet = sheet.getParent().getSheetByName(archiveSheetName);
+  
+  if (!archiveSheet) {
+    archiveSheet = sheet.getParent().insertSheet(archiveSheetName);
+    sheet.getRange(1, 1, 1, 13).copyTo(archiveSheet.getRange(1, 1)); // Copy headers
+  }
+  
+  // Move all but the last keepRows to archive
+  const lastRow = sheet.getLastRow();
+  if (lastRow > keepRows) {
+    const rowsToMove = lastRow - keepRows;
+    const data = sheet.getRange(2, 1, rowsToMove, 13).getValues();
+    archiveSheet.getRange(archiveSheet.getLastRow() + 1, 1, rowsToMove, 13).setValues(data);
+    sheet.deleteRows(2, rowsToMove);
+  }
+}
