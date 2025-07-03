@@ -1,0 +1,564 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Adafruit_Fingerprint.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+#include <pgmspace.h>
+
+// ========== HARDWARE CONFIGURATION ==========
+#define FINGER_RX            16
+#define FINGER_TX            17
+#define GSM_SWITCH           14
+#define GSM_RX               25
+#define GSM_TX               26
+#define BUZZER_PIN           19
+#define OLED_RESET           -1
+#define SCREEN_WIDTH        128
+#define SCREEN_HEIGHT        64
+#define GSM_DEBUG           true  // Set to false to disable GSM debug prints
+
+// ========== STUDENT DATABASE ==========
+struct StudentRecord {
+  int id;
+  const char* name;
+  const char* studentClass;
+  const char* department;
+  const char* contact;
+  const char* secondaryContact;
+};
+
+const StudentRecord STUDENT_DATABASE[] PROGMEM = {
+  {1, "MASABA JONATHAN", "ELECTRONICS", "2023/DEE/DAY/1368", "+256705155891", "+256701306866"},
+  {2, "MPAGI IAN JONATHAN", "ELECTRICAL", "2023/DEE/DAY/1059", "+256743392499", "+256705155891"},
+  {3, "NAKIIRYA SARAH", "MECHANICAL", "2023/DEE/DAY/0391", "+256750078203", "+256781301702"},
+  {4, "NALWADDA AISHA", "BUILDING", "2023/DEE/DAY/1218/G", "+256781301702", "+256750078203"},
+  {5, "KAWEESA MEDAAD", "WELDING", "2023/DEE/DAY/1363", "+256703559029", "+256758245455"},
+  {6, "NANSAMBA GLORIA", "HAIRDRESSING", "2023/DEE/DAY/1437/G", "+256759314436", "+256703559029"},
+  {10, "DERRICK", "ELECTRONICS", "ENGINEERING", "+256758245455", "+256764609750"},
+  {11, "ME", "ELECTRONICS", "2023/DEE/DAY/1363", "+256764609750", "+256764609750"},
+  {12, "TEST", "ELECTRONICS", "1234577", "+256709061212", "+256764609750"}
+};
+
+const int STUDENT_COUNT = sizeof(STUDENT_DATABASE) / sizeof(StudentRecord);
+
+// ========== ATTENDANCE SYSTEM ==========
+struct AttendanceRecord {
+  int id;
+  unsigned long checkInTime;
+  bool isCheckedIn;
+};
+
+AttendanceRecord attendanceRecords[100];
+int recordCount = 0;
+
+// ========== NETWORK CONFIGURATION ==========
+const char* WIFI_SSID = "J Arthur";
+const char* WIFI_PASS = "jomas@2001";
+const char* WEB_APP_URL = "https://script.google.com/macros/s/AKfycbz0l-FQOY_utuXy110gpgmxxnyHdSNZPZQAZWFvWcNcB8kDf2Y_mFOkawYV24KwOY0R/exec";
+
+// ========== GLOBAL OBJECTS ==========
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial2);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+HardwareSerial gsmSerial(1);
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize hardware
+  initOLED();
+  initFingerprintSensor();
+  initGSM();
+  initBuzzer();
+
+  // Connect to WiFi
+  connectToWiFi();
+}
+
+void loop() {
+  displayMessage("Scan Finger");
+
+  int fingerprintID = getFingerprintID();
+  if (fingerprintID != -1) {
+    processFingerprint(fingerprintID);
+    waitForFingerRemoval();
+  }
+
+  // Sync pending records every 5 minutes
+  static unsigned long lastSync = 0;
+  if (millis() - lastSync > 300000 && WiFi.status() == WL_CONNECTED) {
+    syncPendingRecords();
+    lastSync = millis();
+  }
+
+  delay(50);
+}
+
+// ========== GSM FUNCTIONS ==========
+void gsmDebugPrint(String message) {
+  if (GSM_DEBUG) {
+    Serial.print("[GSM] ");
+    Serial.println(message);
+  }
+}
+
+void gsmDebugPrintResponse(String response) {
+  if (GSM_DEBUG) {
+    Serial.println("[GSM Response]");
+    Serial.println(response);
+    Serial.println("----------------");
+  }
+}
+
+void initGSM() {
+  pinMode(GSM_SWITCH, OUTPUT);
+  digitalWrite(GSM_SWITCH, HIGH);
+  delay(1000);
+
+  gsmSerial.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+  delay(2000); // Give modem time to initialize
+
+  gsmDebugPrint("Initializing GSM Module...");
+
+  // Check if modem is responding
+  if (!waitForATResponse("AT", "OK", 3, 2000)) {
+    gsmDebugPrint("GSM Module not responding - check power/connections");
+    return;
+  }
+
+  // Configure modem settings
+  sendATCommand("ATE0", 1000);        // Echo off
+  sendATCommand("AT+CMGF=1", 1000);   // SMS text mode
+  sendATCommand("AT+CSCS=\"GSM\"", 1000); // Character set
+  sendATCommand("AT+CNMI=1,2,0,0,0", 1000); // New SMS indication
+
+  // Check network registration
+  if (!waitForNetwork()) {
+    gsmDebugPrint("Failed to register on network - SMS may not work");
+  } else {
+    gsmDebugPrint("GSM Ready");
+  }
+
+  // Check signal quality
+  checkSignalQuality();
+}
+
+bool waitForATResponse(String cmd, String expected, int retries, unsigned long timeout) {
+  for (int i = 0; i < retries; i++) {
+    gsmSerial.println(cmd);
+    String response = waitForGSMResponse(timeout);
+    gsmDebugPrint("Sent: " + cmd);
+    gsmDebugPrintResponse(response);
+
+    if (response.indexOf(expected) != -1) {
+      return true;
+    }
+    delay(1000);
+  }
+  return false;
+}
+
+String waitForGSMResponse(unsigned long timeout) {
+  String response;
+  unsigned long start = millis();
+
+  while (millis() - start < timeout) {
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      response += c;
+    }
+
+    // If we've received data and nothing new for 50ms, return
+    if (response.length() > 0 && millis() - start > 50 && !gsmSerial.available()) {
+      break;
+    }
+  }
+  return response;
+}
+
+bool waitForNetwork() {
+  displayMessage("GSM Connecting...");
+  gsmDebugPrint("Checking network registration...");
+
+  for (int i = 0; i < 15; i++) { // Increased timeout to 15 tries
+    String response = sendATCommand("AT+CREG?", 2000);
+
+    if (response.indexOf("+CREG: 0,1") != -1) {
+      gsmDebugPrint("Registered to home network");
+      displayMessage("GSM Registered");
+      return true;
+    } else if (response.indexOf("+CREG: 0,5") != -1) {
+      gsmDebugPrint("Registered (roaming)");
+      displayMessage("GSM Registered");
+      return true;
+    } else if (response.indexOf("+CREG: 0,2") != -1) {
+      gsmDebugPrint("Searching for network...");
+    } else {
+      gsmDebugPrint("Unexpected response: " + response);
+    }
+    delay(1000);
+  }
+
+  gsmDebugPrint("Failed to register on network");
+  displayMessage("GSM No Network!");
+  return false;
+}
+
+void checkSignalQuality() {
+  String response = sendATCommand("AT+CSQ", 2000);
+  gsmDebugPrint("Signal quality: " + response);
+}
+
+String sendATCommand(String command, unsigned long timeout) {
+  gsmDebugPrint("Sending: " + command);
+  gsmSerial.println(command);
+  String response = waitForGSMResponse(timeout);
+  gsmDebugPrintResponse(response);
+  return response;
+}
+
+bool sendSMS(const char* number, const String &message) {
+  if (strlen(number) == 0 || strcmp(number, "N/A") == 0) {
+    gsmDebugPrint("Invalid phone number - SMS not sent");
+    return false;
+  }
+
+  gsmDebugPrint("Preparing to send SMS to: " + String(number));
+
+  // 1. Set SMS to text mode
+  if (!waitForATResponse("AT+CMGF=1", "OK", 2, 2000)) {
+    gsmDebugPrint("Failed to set SMS mode");
+    return false;
+  }
+
+  // 2. Set recipient number
+  gsmSerial.print("AT+CMGS=\"");
+  gsmSerial.print(number);
+  gsmSerial.println("\"");
+
+  // 3. Wait for ">" prompt with longer timeout
+  unsigned long promptTimeout = millis();
+  bool gotPrompt = false;
+  while (millis() - promptTimeout < 5000) {
+    if (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      if (c == '>') {
+        gotPrompt = true;
+        break;
+      }
+    }
+  }
+
+  if (!gotPrompt) {
+    gsmDebugPrint("Failed to get SMS prompt");
+    gsmSerial.println(); // Cancel any pending operation
+    return false;
+  }
+
+  // 4. Send message content with proper delays
+  gsmSerial.print(message);
+  delay(100); // Important delay before sending CTRL+Z
+
+  // 5. Send CTRL+Z to finish
+  gsmSerial.write(26);
+  gsmDebugPrint("Message sent, waiting for confirmation...");
+
+  // 6. Wait for final confirmation
+  String response;
+  unsigned long startTime = millis();
+  while (millis() - startTime < 15000) { // 15 second timeout
+    while (gsmSerial.available()) {
+      char c = gsmSerial.read();
+      response += c;
+
+      // If we see the response we're looking for, return immediately
+      if (response.indexOf("+CMGS:") != -1) {
+        gsmDebugPrintResponse(response);
+        gsmDebugPrint("SMS sent successfully with ID");
+        return true;
+      }
+      if (response.indexOf("OK") != -1) {
+        gsmDebugPrintResponse(response);
+        gsmDebugPrint("SMS sent successfully");
+        return true;
+      }
+    }
+  }
+
+  gsmDebugPrintResponse(response);
+  if (response.length() == 0) {
+    gsmDebugPrint("No response from module - check power/connection");
+  } else {
+    gsmDebugPrint("SMS send may have failed");
+  }
+  return false;
+}
+
+// ========== FINGERPRINT FUNCTIONS ==========
+void initFingerprintSensor() {
+  Serial2.begin(57600, SERIAL_8N1, FINGER_RX, FINGER_TX);
+  finger.begin(57600);
+
+  if (finger.verifyPassword()) {
+    displayMessage("Fingerprint OK");
+  } else {
+    displayMessage("Fingerprint FAIL");
+    while (1) {
+      delay(1000);
+    }
+  }
+  delay(1000);
+}
+
+int getFingerprintID() {
+  if (finger.getImage() != FINGERPRINT_OK) return -1;
+  if (finger.image2Tz() != FINGERPRINT_OK) return -1;
+  if (finger.fingerFastSearch() != FINGERPRINT_OK) return -1;
+
+  // Only accept high confidence matches
+  if (finger.confidence < 100) return -1;
+
+  return finger.fingerID;
+}
+
+void waitForFingerRemoval() {
+  while (finger.getImage() != FINGERPRINT_NOFINGER) {
+    delay(50);
+  }
+}
+
+// ========== STUDENT PROCESSING ==========
+void processFingerprint(int id) {
+  buzz();
+  displayProcessing(id);
+
+  // Find student in database
+  const StudentRecord* student = findStudent(id);
+  if (!student) {
+    displayMessage("ID not found");
+    return;
+  }
+
+  // Check attendance status
+  int recordIndex = findAttendanceRecord(id);
+
+  if (recordIndex != -1 && attendanceRecords[recordIndex].isCheckedIn) {
+    // Check out process
+    attendanceRecords[recordIndex].isCheckedIn = false;
+    unsigned long duration = (millis() - attendanceRecords[recordIndex].checkInTime) / 60000;
+
+    displayMessage("Checked OUT!");
+    String message = createCheckOutMessage(student->name, student->studentClass, String(duration));
+    if (!sendSMS(student->contact, message)) {
+      gsmDebugPrint("Attempting to send to secondary contact");
+      sendSMS(student->secondaryContact, message);
+    }
+
+    // Sync with Google Sheets if WiFi available
+    if (WiFi.status() == WL_CONNECTED) {
+      syncWithGoogleSheets(id, false, duration);
+    }
+  } else {
+    // Check in process
+    if (recordCount < 100) {
+      attendanceRecords[recordCount].id = id;
+      attendanceRecords[recordCount].checkInTime = millis();
+      attendanceRecords[recordCount].isCheckedIn = true;
+      recordCount++;
+
+      displayMessage("Checked IN!");
+      String message = createCheckInMessage(student->name, student->studentClass);
+      if (!sendSMS(student->contact, message)) {
+        gsmDebugPrint("Attempting to send to secondary contact");
+        sendSMS(student->secondaryContact, message);
+      }
+
+      // Sync with Google Sheets if WiFi available
+      if (WiFi.status() == WL_CONNECTED) {
+        syncWithGoogleSheets(id, true, 0);
+      }
+    } else {
+      displayMessage("Storage FULL!");
+    }
+  }
+}
+
+// ========== DATABASE FUNCTIONS ==========
+const StudentRecord* findStudent(int id) {
+  for (int i = 0; i < STUDENT_COUNT; i++) {
+    if (pgm_read_word(&STUDENT_DATABASE[i].id) == id) {
+      return &STUDENT_DATABASE[i];
+    }
+  }
+  return nullptr;
+}
+
+int findAttendanceRecord(int id) {
+  for (int i = 0; i < recordCount; i++) {
+    if (attendanceRecords[i].id == id && attendanceRecords[i].isCheckedIn) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ========== WIFI FUNCTIONS ==========
+void connectToWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  displayMessage("Connecting WiFi...");
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) { // 15s timeout
+    delay(500);
+    displayMessage("Connecting WiFi...\n" + String((millis() - startTime) / 1000) + "s");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    displayMessage("WiFi Connected!\nIP: " + WiFi.localIP().toString());
+  } else {
+    displayMessage("WiFi Failed!\nUsing SMS Only");
+  }
+  delay(1000);
+}
+
+// ========== GOOGLE SHEETS SYNC ==========
+void syncWithGoogleSheets(int id, bool isCheckIn, unsigned long duration) {
+  HTTPClient http;
+  String url = String(WEB_APP_URL) + "?id=" + String(id) +
+               "&checkin=" + String(isCheckIn ? "1" : "0") +
+               "&duration=" + String(duration);
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    gsmDebugPrint("Sync successful: " + payload);
+  } else {
+    gsmDebugPrint("Sync failed: " + String(httpCode));
+  }
+  http.end();
+}
+
+void syncPendingRecords() {
+  for (int i = 0; i < recordCount; i++) {
+    if (attendanceRecords[i].isCheckedIn) {
+      unsigned long duration = (millis() - attendanceRecords[i].checkInTime) / 60000;
+      syncWithGoogleSheets(attendanceRecords[i].id, true, duration);
+    }
+  }
+}
+
+// ========== MESSAGE FORMATTING ==========
+String createCheckInMessage(const char* name, const char* studentClass) {
+  String message = "SCHOOL ARRIVAL NOTIFICATION\n";
+  message += "----------------------------\n";
+  message += "Student: " + String(name) + "\n";
+  message += "Class: " + String(studentClass) + "\n";
+
+  // Get current time (try NTP first, then fallback)
+  String timeStr = getFormattedTime();
+  if (timeStr.length() > 0) {
+    message += "Time: " + timeStr + "\n";
+  }
+
+  message += "Status: CHECKED IN\n";
+  return message;
+}
+
+String createCheckOutMessage(const char* name, const char* studentClass, String duration) {
+  String message = "SCHOOL DEPARTURE NOTIFICATION\n";
+  message += "------------------------------\n";
+  message += "Student: " + String(name) + "\n";
+  message += "Class: " + String(studentClass) + "\n";
+  message += "Duration: " + duration + " minutes\n";
+
+  // Get current time (try NTP first, then fallback)
+  String timeStr = getFormattedTime();
+  if (timeStr.length() > 0) {
+    message += "Time: " + timeStr + "\n";
+  }
+
+  message += "Status: CHECKED OUT\n";
+  return message;
+}
+
+String getFormattedTime() {
+  static bool timeConfigured = false;
+
+  // Configure time if WiFi is connected and not already configured
+  if (WiFi.status() == WL_CONNECTED && !timeConfigured) {
+    configTime(0, 0, "pool.ntp.org");  // UTC time
+    timeConfigured = true;
+  }
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char buffer[30];
+    // Format: 14:30:45 21/04/2023
+    strftime(buffer, sizeof(buffer), "%H:%M:%S %d/%m/%Y", &timeinfo);
+    return String(buffer);
+  }
+
+  // Fallback to millis-based relative time if NTP fails
+  unsigned long seconds = millis() / 1000;
+  int hours = (seconds / 3600) % 24;
+  int minutes = (seconds / 60) % 60;
+  int secs = seconds % 60;
+
+  char buffer[20];
+  sprintf(buffer, "%02d:%02d:%02d (device time)", hours, minutes, secs);
+  return String(buffer);
+}
+// ========== DISPLAY FUNCTIONS ==========
+void initOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED failed");
+    while (1) {
+      delay(1000);
+    }
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("System Ready");
+  display.display();
+}
+
+void displayMessage(String message) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+
+  // Handle multi-line messages
+  int newlinePos = message.indexOf('\n');
+  if (newlinePos != -1) {
+    display.println(message.substring(0, newlinePos));
+    display.println(message.substring(newlinePos + 1));
+  } else {
+    display.println(message);
+  }
+  display.display();
+}
+
+void displayProcessing(int id) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("ID: ");
+  display.println(id);
+  display.println("Processing...");
+  display.display();
+}
+
+// ========== BUZZER FUNCTIONS ==========
+void initBuzzer() {
+  pinMode(BUZZER_PIN, OUTPUT);
+}
+
+void buzz() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(100);
+  digitalWrite(BUZZER_PIN, LOW);
+}
